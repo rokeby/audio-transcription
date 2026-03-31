@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Audio Transcription</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f5f5f7;
+      color: #1d1d1f;
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 40px 16px 80px;
+    }
+
+    .container { width: 100%; max-width: 720px; }
+
+    h1 { font-size: 28px; font-weight: 700; margin-bottom: 6px; }
+    .subtitle { color: #6e6e73; font-size: 14px; margin-bottom: 28px; }
+
+    .card {
+      background: #fff;
+      border-radius: 16px;
+      padding: 24px;
+      margin-bottom: 16px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: #6e6e73;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    input[type="text"], input[type="password"], select {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1.5px solid #e0e0e5;
+      border-radius: 8px;
+      font-size: 14px;
+      font-family: inherit;
+      background: #fafafa;
+      transition: border-color 0.15s;
+      outline: none;
+    }
+
+    input[type="text"]:focus, input[type="password"]:focus, select:focus {
+      border-color: #0071e3;
+      background: #fff;
+    }
+
+    .field { margin-bottom: 16px; }
+    .field:last-child { margin-bottom: 0; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+    .dropzone {
+      border: 2px dashed #c7c7cc;
+      border-radius: 12px;
+      padding: 36px 24px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      position: relative;
+    }
+    .dropzone.drag-over { border-color: #0071e3; background: #f0f6ff; }
+    .dropzone input[type="file"] {
+      position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+    }
+    .dropzone-icon { font-size: 32px; margin-bottom: 8px; }
+    .dropzone-label { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+    .dropzone-sub { font-size: 13px; color: #6e6e73; }
+    .file-chosen {
+      margin-top: 10px; font-size: 13px; background: #f0f6ff;
+      border-radius: 8px; padding: 8px 12px; display: none;
+    }
+
+    .btn-primary {
+      width: 100%; padding: 14px; background: #0071e3; color: #fff;
+      border: none; border-radius: 10px; font-size: 15px; font-weight: 600;
+      cursor: pointer; transition: background 0.15s; font-family: inherit;
+    }
+    .btn-primary:hover { background: #0077ed; }
+    .btn-primary:disabled { background: #a0c4f0; cursor: not-allowed; }
+
+    .btn-secondary {
+      padding: 8px 16px; background: #f5f5f7; color: #1d1d1f;
+      border: none; border-radius: 8px; font-size: 13px; font-weight: 600;
+      cursor: pointer; transition: background 0.15s; font-family: inherit;
+    }
+    .btn-secondary:hover { background: #e5e5ea; }
+    .btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .btn-speaker {
+      padding: 9px 18px; background: #1d1d1f; color: #fff;
+      border: none; border-radius: 8px; font-size: 13px; font-weight: 600;
+      cursor: pointer; transition: background 0.15s; font-family: inherit;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .btn-speaker:hover { background: #333; }
+    .btn-speaker:disabled { background: #999; cursor: not-allowed; }
+
+    .progress-wrap { display: none; margin-top: 16px; }
+    .progress-bar-bg { background: #e5e5ea; border-radius: 100px; height: 6px; overflow: hidden; }
+    .progress-bar { height: 100%; width: 0%; background: #0071e3; border-radius: 100px; transition: width 0.4s ease; }
+    .progress-label { font-size: 13px; color: #6e6e73; margin-top: 6px; text-align: center; }
+
+    .error-msg {
+      background: #fff2f2; color: #c0392b; border-radius: 8px;
+      padding: 12px 16px; font-size: 14px; margin-top: 12px; display: none;
+    }
+
+    .hint { font-size: 12px; color: #6e6e73; margin-top: 5px; }
+
+    .result-card { display: none; background: #fff; border-radius: 16px; padding: 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+
+    .result-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 16px; flex-wrap: wrap; gap: 10px;
+    }
+    .result-title { font-size: 15px; font-weight: 700; }
+    .result-meta { font-size: 12px; color: #6e6e73; }
+    .result-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+    .tabs { display: flex; gap: 4px; margin-bottom: 16px; background: #f5f5f7; border-radius: 10px; padding: 4px; }
+    .tab {
+      flex: 1; padding: 7px; text-align: center; font-size: 13px; font-weight: 600;
+      border-radius: 7px; cursor: pointer; color: #6e6e73; transition: all 0.15s; user-select: none;
+    }
+    .tab.active { background: #fff; color: #1d1d1f; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+
+    .plain-text {
+      font-size: 15px; line-height: 1.7; white-space: pre-wrap;
+      word-break: break-word; color: #1d1d1f;
+    }
+
+    .segments-view { display: flex; flex-direction: column; gap: 2px; }
+    .seg-row {
+      display: flex; gap: 12px; padding: 6px 8px; border-radius: 8px;
+      transition: background 0.1s; align-items: flex-start;
+    }
+    .seg-row:hover { background: #f5f5f7; }
+    .seg-time {
+      font-size: 11px; color: #6e6e73; white-space: nowrap;
+      font-variant-numeric: tabular-nums; padding-top: 3px; min-width: 42px;
+    }
+    .seg-text { font-size: 14px; line-height: 1.65; color: #1d1d1f; flex: 1; }
+
+    .speaker-view { display: flex; flex-direction: column; gap: 0; }
+    .speaker-group { margin-bottom: 16px; }
+    .speaker-label {
+      font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+      text-transform: uppercase; margin-bottom: 4px; padding-left: 2px;
+    }
+    .speaker-bubble {
+      display: inline-block; padding: 10px 14px; border-radius: 14px;
+      font-size: 14px; line-height: 1.6; max-width: 88%; word-break: break-word;
+    }
+    .speaker-bubble-time { font-size: 11px; color: #6e6e73; margin-top: 4px; padding-left: 4px; }
+
+    .spk-1 .speaker-bubble { background: #e8f4fd; }
+    .spk-1 .speaker-label { color: #1a6fa8; }
+    .spk-2 .speaker-bubble { background: #fde8f4; }
+    .spk-2 .speaker-label { color: #a81a6f; }
+    .spk-3 .speaker-bubble { background: #e8fde8; }
+    .spk-3 .speaker-label { color: #1a8a1a; }
+    .spk-4 .speaker-bubble { background: #fdf4e8; }
+    .spk-4 .speaker-label { color: #a86a1a; }
+    .spk-5 .speaker-bubble { background: #f0e8fd; }
+    .spk-5 .speaker-label { color: #6a1aa8; }
+    .spk-6 .speaker-bubble { background: #e8fdfd; }
+    .spk-6 .speaker-label { color: #1a8aa8; }
+
+    .spinner {
+      width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.4);
+      border-top-color: #fff; border-radius: 50%; animation: spin 0.7s linear infinite;
+      display: inline-block;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>Audio Transcription</h1>
+  <p class="subtitle">Powered by OpenAI Whisper &mdash; runs entirely in your browser</p>
+
+  <form id="transcribeForm">
+    <div class="card">
+      <div class="field">
+        <label>OpenAI API Key</label>
+        <input type="password" id="apiKey" placeholder="sk-..." autocomplete="off">
+        <p class="hint">Stored only in this browser tab — sent directly to OpenAI, never via a third-party server.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="field">
+        <label>Audio File</label>
+        <div class="dropzone" id="dropzone">
+          <input type="file" id="fileInput" accept=".mp3,.mp4,.mpeg,.mpga,.m4a,.wav,.webm,.ogg,.flac">
+          <div class="dropzone-icon">🎙️</div>
+          <div class="dropzone-label">Drop file here or click to browse</div>
+          <div class="dropzone-sub">MP3, M4A, WAV, FLAC, WEBM, OGG — up to 25 MB</div>
+        </div>
+        <div class="file-chosen" id="fileChosen"></div>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label>Language <span style="font-weight:400;text-transform:none">(optional)</span></label>
+          <select id="language">
+            <option value="">Auto-detect</option>
+            <option value="en">English</option>
+            <option value="zh">Chinese</option>
+            <option value="es">Spanish</option>
+            <option value="fr">French</option>
+            <option value="de">German</option>
+            <option value="ja">Japanese</option>
+            <option value="ko">Korean</option>
+            <option value="pt">Portuguese</option>
+            <option value="ru">Russian</option>
+            <option value="ar">Arabic</option>
+            <option value="it">Italian</option>
+            <option value="nl">Dutch</option>
+            <option value="pl">Polish</option>
+            <option value="sv">Swedish</option>
+            <option value="tr">Turkish</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Prompt <span style="font-weight:400;text-transform:none">(optional)</span></label>
+          <input type="text" id="prompt" placeholder="Spelling hints, context…">
+        </div>
+      </div>
+
+      <button type="submit" class="btn-primary" id="submitBtn">Transcribe</button>
+
+      <div class="progress-wrap" id="progressWrap">
+        <div class="progress-bar-bg"><div class="progress-bar" id="progressBar"></div></div>
+        <div class="progress-label" id="progressLabel">Uploading…</div>
+      </div>
+
+      <div class="error-msg" id="errorMsg"></div>
+    </div>
+  </form>
+
+  <div class="result-card" id="resultCard">
+    <div class="result-header">
+      <div>
+        <div class="result-title">Transcript</div>
+        <div class="result-meta" id="resultMeta"></div>
+      </div>
+      <div class="result-actions">
+        <button class="btn-speaker" id="diarizeBtn" style="display:none">
+          <span>Identify Speakers</span>
+        </button>
+        <button class="btn-secondary" id="copyBtn">Copy</button>
+      </div>
+    </div>
+
+    <div class="tabs" id="tabs">
+      <div class="tab active" data-tab="plain">Plain Text</div>
+      <div class="tab" data-tab="segments">Segments</div>
+      <div class="tab" data-tab="speakers" id="speakersTab" style="display:none">Speakers</div>
+    </div>
+
+    <div class="tab-panel active" id="panel-plain">
+      <div class="plain-text" id="plainText"></div>
+    </div>
+    <div class="tab-panel" id="panel-segments">
+      <div class="segments-view" id="segmentsView"></div>
+    </div>
+    <div class="tab-panel" id="panel-speakers">
+      <div class="speaker-view" id="speakerView"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── State ──────────────────────────────────────────────────────────────────
+  let currentSegments = [];
+
+  // ── Elements ───────────────────────────────────────────────────────────────
+  const form          = document.getElementById("transcribeForm");
+  const fileInput     = document.getElementById("fileInput");
+  const dropzone      = document.getElementById("dropzone");
+  const fileChosen    = document.getElementById("fileChosen");
+  const submitBtn     = document.getElementById("submitBtn");
+  const progressWrap  = document.getElementById("progressWrap");
+  const progressBar   = document.getElementById("progressBar");
+  const progressLabel = document.getElementById("progressLabel");
+  const errorMsg      = document.getElementById("errorMsg");
+  const resultCard    = document.getElementById("resultCard");
+  const resultMeta    = document.getElementById("resultMeta");
+  const plainText     = document.getElementById("plainText");
+  const segmentsView  = document.getElementById("segmentsView");
+  const speakerView   = document.getElementById("speakerView");
+  const diarizeBtn    = document.getElementById("diarizeBtn");
+  const copyBtn       = document.getElementById("copyBtn");
+  const speakersTab   = document.getElementById("speakersTab");
+  const apiKeyInput   = document.getElementById("apiKey");
+
+  // ── API key persistence ────────────────────────────────────────────────────
+  const savedKey = sessionStorage.getItem("oai_key");
+  if (savedKey) apiKeyInput.value = savedKey;
+  apiKeyInput.addEventListener("input", e => sessionStorage.setItem("oai_key", e.target.value));
+
+  // ── Drag and drop ──────────────────────────────────────────────────────────
+  dropzone.addEventListener("dragover", e => { e.preventDefault(); dropzone.classList.add("drag-over"); });
+  dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag-over"));
+  dropzone.addEventListener("drop", e => {
+    e.preventDefault(); dropzone.classList.remove("drag-over");
+    if (e.dataTransfer.files.length) { fileInput.files = e.dataTransfer.files; showFile(fileInput.files[0]); }
+  });
+  fileInput.addEventListener("change", () => { if (fileInput.files.length) showFile(fileInput.files[0]); });
+
+  function showFile(f) {
+    fileChosen.style.display = "block";
+    fileChosen.textContent = `${f.name}  (${(f.size/1024/1024).toFixed(2)} MB)`;
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  function showError(msg) { errorMsg.textContent = msg; errorMsg.style.display = "block"; }
+  function hideError()    { errorMsg.style.display = "none"; }
+  function resetUI()      { submitBtn.disabled = false; progressWrap.style.display = "none"; }
+
+  function fmtTime(secs) {
+    const m = Math.floor(secs / 60), s = Math.floor(secs % 60);
+    const h = Math.floor(m / 60);
+    return h ? `${h}:${String(m%60).padStart(2,"0")}:${String(s).padStart(2,"0")}`
+             : `${m}:${String(s).padStart(2,"0")}`;
+  }
+
+  function fmtDur(secs) {
+    const m = Math.floor(secs / 60), s = Math.round(secs % 60);
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
+
+  function escHtml(str) {
+    return str.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
+
+  // ── Tabs ───────────────────────────────────────────────────────────────────
+  document.getElementById("tabs").addEventListener("click", e => {
+    const tab = e.target.closest(".tab");
+    if (!tab) return;
+    switchTab(tab.dataset.tab);
+  });
+
+  function switchTab(name) {
+    document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
+    document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + name));
+  }
+
+  // ── Transcribe ─────────────────────────────────────────────────────────────
+  form.addEventListener("submit", async e => {
+    e.preventDefault();
+    hideError();
+    resultCard.style.display = "none";
+
+    const apiKey = apiKeyInput.value.trim();
+    if (!apiKey) { showError("Please enter your OpenAI API key."); return; }
+    if (!fileInput.files.length) { showError("Please select an audio file."); return; }
+
+    const file = fileInput.files[0];
+    if (file.size > 25 * 1024 * 1024) {
+      showError(`File is ${(file.size/1024/1024).toFixed(1)} MB — OpenAI Whisper's limit is 25 MB.`);
+      return;
+    }
+
+    submitBtn.disabled = true;
+    progressWrap.style.display = "block";
+    progressBar.style.width = "0%";
+    progressLabel.textContent = "Uploading…";
+
+    // Animate bar while waiting (fetch doesn't expose upload progress)
+    let pct = 0;
+    const iv = setInterval(() => {
+      if (pct < 90) { pct += pct < 60 ? 3 : 0.5; progressBar.style.width = pct + "%"; }
+      if (pct >= 60) progressLabel.textContent = "Transcribing…";
+    }, 300);
+
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      body.append("model", "whisper-1");
+      body.append("response_format", "verbose_json");
+      body.append("timestamp_granularities[]", "segment");
+      const lang = document.getElementById("language").value;
+      const prompt = document.getElementById("prompt").value.trim();
+      if (lang)   body.append("language", lang);
+      if (prompt) body.append("prompt", prompt);
+
+      const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${apiKey}` },
+        body,
+      });
+
+      const data = await res.json();
+      clearInterval(iv);
+      progressBar.style.width = "100%";
+      resetUI();
+
+      if (!res.ok) {
+        showError(data.error?.message || `OpenAI error ${res.status}`);
+        return;
+      }
+
+      // Normalise segments
+      currentSegments = (data.segments || []).map((s, i) => ({
+        id: s.id ?? i,
+        start: s.start,
+        end: s.end,
+        start_fmt: fmtTime(s.start),
+        end_fmt: fmtTime(s.end),
+        text: s.text.trim(),
+      }));
+
+      renderResult(data);
+
+    } catch (err) {
+      clearInterval(iv);
+      resetUI();
+      showError("Request failed: " + err.message);
+    }
+  });
+
+  // ── Render result ──────────────────────────────────────────────────────────
+  function renderResult(data) {
+    const parts = [];
+    if (data.language) parts.push(data.language.toUpperCase());
+    if (data.duration)  parts.push(fmtDur(data.duration));
+    if (currentSegments.length) parts.push(`${currentSegments.length} segments`);
+    resultMeta.textContent = parts.join(" · ");
+
+    plainText.textContent = formatPlainText(data.text, currentSegments);
+
+    segmentsView.innerHTML = "";
+    if (currentSegments.length) {
+      currentSegments.forEach(s => {
+        const row = document.createElement("div");
+        row.className = "seg-row";
+        row.innerHTML = `<div class="seg-time">${s.start_fmt}</div><div class="seg-text">${escHtml(s.text)}</div>`;
+        segmentsView.appendChild(row);
+      });
+      diarizeBtn.style.display = "inline-flex";
+    } else {
+      segmentsView.innerHTML = `<div style="color:#6e6e73;font-size:14px">No segment data returned.</div>`;
+    }
+
+    speakersTab.style.display = "none";
+    speakerView.innerHTML = "";
+    switchTab("plain");
+
+    resultCard.style.display = "block";
+    resultCard.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function formatPlainText(fullText, segments) {
+    if (!segments || segments.length < 2) return fullText.trim();
+    const lines = [];
+    let buf = segments[0].text;
+    for (let i = 1; i < segments.length; i++) {
+      const gap = segments[i].start - segments[i-1].end;
+      if (gap > 1.5) { lines.push(buf.trim()); buf = segments[i].text; }
+      else buf += " " + segments[i].text;
+    }
+    lines.push(buf.trim());
+    return lines.join("\n\n");
+  }
+
+  // ── Diarize ────────────────────────────────────────────────────────────────
+  diarizeBtn.addEventListener("click", async () => {
+    if (!currentSegments.length) return;
+    const apiKey = apiKeyInput.value.trim();
+    if (!apiKey) { showError("API key required for speaker detection."); return; }
+
+    diarizeBtn.disabled = true;
+    diarizeBtn.innerHTML = `<span class="spinner"></span> Identifying…`;
+
+    const lines = currentSegments.map(s => `[${s.id}] (${s.start_fmt}) ${s.text}`).join("\n");
+    const systemPrompt = `You are an expert speaker diarization assistant. Given numbered transcript segments, identify which speaker said each segment. Use consistent labels: "Speaker 1", "Speaker 2", etc. Base decisions on conversational turn-taking, question/answer patterns, and linguistic style. Return ONLY valid JSON: {"speakers":[{"id":0,"speaker":"Speaker 1"},…]}. No markdown, no explanation.`;
+
+    try {
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          temperature: 0,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: `Transcript segments:\n\n${lines}` },
+          ],
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || `OpenAI error ${res.status}`);
+
+      const result = JSON.parse(data.choices[0].message.content);
+      renderSpeakers(result.speakers);
+
+    } catch (err) {
+      showError("Speaker detection failed: " + err.message);
+    } finally {
+      diarizeBtn.disabled = false;
+      diarizeBtn.innerHTML = `<span>Re-identify Speakers</span>`;
+    }
+  });
+
+  // ── Render speakers ────────────────────────────────────────────────────────
+  function renderSpeakers(speakerMap) {
+    const byId = {};
+    speakerMap.forEach(s => byId[s.id] = s.speaker);
+
+    const speakerIndex = {};
+    let nextIdx = 1;
+    currentSegments.forEach(s => {
+      const spk = byId[s.id] || "Unknown";
+      if (!(spk in speakerIndex)) speakerIndex[spk] = nextIdx++;
+    });
+
+    const groups = [];
+    currentSegments.forEach(s => {
+      const spk = byId[s.id] || "Unknown";
+      if (groups.length && groups[groups.length-1].speaker === spk)
+        groups[groups.length-1].segments.push(s);
+      else
+        groups.push({ speaker: spk, segments: [s] });
+    });
+
+    speakerView.innerHTML = "";
+    groups.forEach(g => {
+      const idx = Math.min(speakerIndex[g.speaker] || 1, 6);
+      const text = g.segments.map(s => s.text).join(" ");
+      const div = document.createElement("div");
+      div.className = `speaker-group spk-${idx}`;
+      div.innerHTML = `
+        <div class="speaker-label">${escHtml(g.speaker)}</div>
+        <div class="speaker-bubble">${escHtml(text)}</div>
+        <div class="speaker-bubble-time">${g.segments[0].start_fmt} – ${g.segments[g.segments.length-1].end_fmt}</div>
+      `;
+      speakerView.appendChild(div);
+    });
+
+    speakersTab.style.display = "";
+    switchTab("speakers");
+  }
+
+  // ── Copy ───────────────────────────────────────────────────────────────────
+  copyBtn.addEventListener("click", () => {
+    const activeTab = document.querySelector(".tab.active")?.dataset.tab || "plain";
+    let text = "";
+    if (activeTab === "plain") {
+      text = plainText.textContent;
+    } else if (activeTab === "segments") {
+      text = currentSegments.map(s => `[${s.start_fmt}] ${s.text}`).join("\n");
+    } else {
+      text = Array.from(speakerView.querySelectorAll(".speaker-group")).map(g =>
+        `${g.querySelector(".speaker-label").textContent}\n${g.querySelector(".speaker-bubble").textContent}`
+      ).join("\n\n");
+    }
+    navigator.clipboard.writeText(text).then(() => {
+      copyBtn.textContent = "Copied!";
+      setTimeout(() => copyBtn.textContent = "Copy", 2000);
+    });
+  });
+</script>
+</body>
+</html>
