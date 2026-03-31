@@ -341,8 +341,10 @@
 
 <script>
   // ── State ──────────────────────────────────────────────────────────────────
-  let currentSegments = [];
-  let currentApiKey = "";
+  let currentSegments  = [];
+  let currentApiKey    = "";
+  let polishedSegments = {}; // id → polished text
+  let lastSpeakerMap   = null;
 
   // ── Elements ───────────────────────────────────────────────────────────────
   const form        = document.getElementById("transcribeForm");
@@ -609,7 +611,9 @@
     speakersTab.style.display  = "none";
     polishedTab.style.display  = "none";
     polishedText.textContent   = "";
-    speakerView.innerHTML = "";
+    polishedSegments           = {};
+    lastSpeakerMap             = null;
+    speakerView.innerHTML      = "";
     switchTab("plain");
 
     resultCard.style.display = "block";
@@ -617,16 +621,18 @@
   }
 
   function formatPlainText(fullText, segments) {
-    if (!segments || segments.length < 2) return fullText.trim();
-    const lines = [];
-    let buf = segments[0].text;
-    for (let i = 1; i < segments.length; i++) {
-      const gap = segments[i].start - segments[i - 1].end;
-      if (gap > 1.5) { lines.push(buf.trim()); buf = segments[i].text; }
-      else buf += " " + segments[i].text;
+    if (segments && segments.length >= 2) {
+      const lines = [];
+      let buf = segments[0].text;
+      for (let i = 1; i < segments.length; i++) {
+        const gap = segments[i].start - segments[i - 1].end;
+        if (gap > 1.5) { lines.push(buf.trim()); buf = segments[i].text; }
+        else buf += " " + segments[i].text;
+      }
+      lines.push(buf.trim());
+      return lines.filter(l => l).join("\n\n");
     }
-    lines.push(buf.trim());
-    return lines.join("\n\n");
+    return (fullText || "").trim();
   }
 
   // ── Polish ─────────────────────────────────────────────────────────────────
@@ -636,15 +642,15 @@
     polishBtn.disabled = true;
     polishBtn.innerHTML = `<span class="spinner"></span> Polishing…`;
 
-    const raw = document.getElementById("plainText").textContent.trim();
+    const segLines = currentSegments.map(s => `[${s.id}] ${s.text}`).join("\n");
     const systemPrompt =
       "You are a professional transcript editor. " +
-      "Your job is to clean up a speech transcript — fix punctuation, capitalisation, and sentence boundaries, " +
+      "Given numbered transcript segments, clean each one: fix punctuation, capitalisation and sentence boundaries, " +
       "and silently remove filler words and sounds (um, uh, er, ah, hmm, like [as filler], you know [as filler], " +
-      "right [as filler], so [sentence-starting filler], false starts, repetitions). " +
+      "right [as filler], so [sentence-starting filler], false starts, and immediate repetitions). " +
       "Preserve every meaningful word and the speaker's vocabulary exactly. " +
-      "Preserve paragraph breaks. " +
-      "Return only the cleaned transcript — no commentary, no headings, no markdown.";
+      "Return ONLY valid JSON — no markdown, no explanation: " +
+      "{\"segments\": [{\"id\": 0, \"text\": \"cleaned text\"}, ...]}";
 
     try {
       const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -653,9 +659,10 @@
         body: JSON.stringify({
           model: "gpt-4o-mini",
           temperature: 0.2,
+          response_format: { type: "json_object" },
           messages: [
             { role: "system", content: systemPrompt },
-            { role: "user",   content: raw },
+            { role: "user",   content: segLines },
           ],
         }),
       });
@@ -663,9 +670,17 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error?.message || `OpenAI error ${res.status}`);
 
-      polishedText.textContent = data.choices[0].message.content.trim();
+      const result = JSON.parse(data.choices[0].message.content);
+      polishedSegments = {};
+      (result.segments || []).forEach(s => { polishedSegments[s.id] = s.text; });
+
+      const polishedSegs = currentSegments.map(s => ({ ...s, text: polishedSegments[s.id] ?? s.text }));
+      polishedText.textContent = formatPlainText(null, polishedSegs);
+
       polishedTab.style.display = "";
       switchTab("polished");
+
+      if (lastSpeakerMap) renderSpeakers(lastSpeakerMap);
     } catch (err) {
       showError("Polishing failed: " + err.message);
     } finally {
@@ -680,14 +695,20 @@
     diarizeBtn.disabled = true;
     diarizeBtn.innerHTML = `<span class="spinner"></span> Identifying…`;
 
+    // Use polished segment text if available for better diarization quality
+    const segsForDiarize = currentSegments.map(s => ({
+      ...s, text: polishedSegments[s.id] ?? s.text
+    }));
+
     try {
       const res = await fetch("/diarize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ segments: currentSegments, api_key: currentApiKey }),
+        body: JSON.stringify({ segments: segsForDiarize, api_key: currentApiKey }),
       });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || "Diarization failed");
+      lastSpeakerMap = data.speakers;
       renderSpeakers(data.speakers);
     } catch (err) {
       showError("Speaker detection failed: " + err.message);
@@ -721,7 +742,7 @@
     speakerView.innerHTML = "";
     groups.forEach(g => {
       const idx  = Math.min(speakerIndex[g.speaker] || 1, 6);
-      const text = g.segments.map(s => s.text).join(" ");
+      const text = g.segments.map(s => polishedSegments[s.id] ?? s.text).join(" ");
       const div  = document.createElement("div");
       div.className = `speaker-group spk-${idx}`;
       div.innerHTML = `

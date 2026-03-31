@@ -305,7 +305,8 @@
 
 <script>
   // ── State ──────────────────────────────────────────────────────────────────
-  let currentSegments = [];
+  let currentSegments   = [];
+  let polishedSegments  = {}; // id → polished text
 
   // ── Elements ───────────────────────────────────────────────────────────────
   const form          = document.getElementById("transcribeForm");
@@ -618,7 +619,8 @@
     speakersTab.style.display  = "none";
     polishedTab.style.display  = "none";
     polishedText.textContent   = "";
-    speakerView.innerHTML = "";
+    polishedSegments           = {};
+    speakerView.innerHTML      = "";
     switchTab("plain");
 
     resultCard.style.display = "block";
@@ -626,16 +628,19 @@
   }
 
   function formatPlainText(fullText, segments) {
-    if (!segments || segments.length < 2) return fullText.trim();
-    const lines = [];
-    let buf = segments[0].text;
-    for (let i = 1; i < segments.length; i++) {
-      const gap = segments[i].start - segments[i-1].end;
-      if (gap > 1.5) { lines.push(buf.trim()); buf = segments[i].text; }
-      else buf += " " + segments[i].text;
+    // Always build from segments when available (works for both original and polished)
+    if (segments && segments.length >= 2) {
+      const lines = [];
+      let buf = segments[0].text;
+      for (let i = 1; i < segments.length; i++) {
+        const gap = segments[i].start - segments[i-1].end;
+        if (gap > 1.5) { lines.push(buf.trim()); buf = segments[i].text; }
+        else buf += " " + segments[i].text;
+      }
+      lines.push(buf.trim());
+      return lines.filter(l => l).join("\n\n");
     }
-    lines.push(buf.trim());
-    return lines.join("\n\n");
+    return (fullText || "").trim();
   }
 
   // ── Polish ─────────────────────────────────────────────────────────────────
@@ -646,15 +651,17 @@
     polishBtn.disabled = true;
     polishBtn.innerHTML = `<span class="spinner"></span> Polishing…`;
 
-    const raw = plainText.textContent.trim();
+    // Send all segments so we get per-segment polished text — this keeps
+    // speaker bubbles and the polished plain text in sync.
+    const segLines = currentSegments.map(s => `[${s.id}] ${s.text}`).join("\n");
     const systemPrompt =
       "You are a professional transcript editor. " +
-      "Your job is to clean up a speech transcript — fix punctuation, capitalisation, and sentence boundaries, " +
+      "Given numbered transcript segments, clean each one: fix punctuation, capitalisation and sentence boundaries, " +
       "and silently remove filler words and sounds (um, uh, er, ah, hmm, like [as filler], you know [as filler], " +
-      "right [as filler], so [sentence-starting filler], false starts, repetitions). " +
+      "right [as filler], so [sentence-starting filler], false starts, and immediate repetitions). " +
       "Preserve every meaningful word and the speaker's vocabulary exactly. " +
-      "Preserve paragraph breaks. " +
-      "Return only the cleaned transcript — no commentary, no headings, no markdown.";
+      "Return ONLY valid JSON — no markdown, no explanation: " +
+      "{\"segments\": [{\"id\": 0, \"text\": \"cleaned text\"}, ...]}";
 
     try {
       const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -663,9 +670,10 @@
         body: JSON.stringify({
           model: "gpt-4o-mini",
           temperature: 0.2,
+          response_format: { type: "json_object" },
           messages: [
             { role: "system", content: systemPrompt },
-            { role: "user",   content: raw },
+            { role: "user",   content: segLines },
           ],
         }),
       });
@@ -673,9 +681,24 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error?.message || `OpenAI error ${res.status}`);
 
-      polishedText.textContent = data.choices[0].message.content.trim();
+      const result = JSON.parse(data.choices[0].message.content);
+      polishedSegments = {};
+      (result.segments || []).forEach(s => { polishedSegments[s.id] = s.text; });
+
+      // Reconstruct polished plain text using the same paragraph-break logic
+      const polishedSegs = currentSegments.map(s => ({
+        ...s, text: polishedSegments[s.id] ?? s.text
+      }));
+      polishedText.textContent = formatPlainText(null, polishedSegs);
+
       polishedTab.style.display = "";
       switchTab("polished");
+
+      // If speakers are already shown, re-render them with polished text
+      if (speakersTab.style.display !== "none") {
+        const currentSpeakerMap = getSpeakerMap();
+        if (currentSpeakerMap) renderSpeakers(currentSpeakerMap);
+      }
     } catch (err) {
       showError("Polishing failed: " + err.message);
     } finally {
@@ -685,6 +708,9 @@
   });
 
   // ── Diarize ────────────────────────────────────────────────────────────────
+  let lastSpeakerMap = null;
+  function getSpeakerMap() { return lastSpeakerMap; }
+
   diarizeBtn.addEventListener("click", async () => {
     if (!currentSegments.length) return;
     const apiKey = apiKeyInput.value.trim();
@@ -693,7 +719,10 @@
     diarizeBtn.disabled = true;
     diarizeBtn.innerHTML = `<span class="spinner"></span> Identifying…`;
 
-    const lines = currentSegments.map(s => `[${s.id}] (${s.start_fmt}) ${s.text}`).join("\n");
+    // Use polished text if available — cleaner input = better speaker detection
+    const lines = currentSegments
+      .map(s => `[${s.id}] (${s.start_fmt}) ${polishedSegments[s.id] ?? s.text}`)
+      .join("\n");
     const systemPrompt = `You are an expert speaker diarization assistant. Given numbered transcript segments, identify which speaker said each segment. Use consistent labels: "Speaker 1", "Speaker 2", etc. Base decisions on conversational turn-taking, question/answer patterns, and linguistic style. Return ONLY valid JSON: {"speakers":[{"id":0,"speaker":"Speaker 1"},…]}. No markdown, no explanation.`;
 
     try {
@@ -715,6 +744,7 @@
       if (!res.ok) throw new Error(data.error?.message || `OpenAI error ${res.status}`);
 
       const result = JSON.parse(data.choices[0].message.content);
+      lastSpeakerMap = result.speakers;
       renderSpeakers(result.speakers);
 
     } catch (err) {
@@ -748,9 +778,10 @@
 
     speakerView.innerHTML = "";
     groups.forEach(g => {
-      const idx = Math.min(speakerIndex[g.speaker] || 1, 6);
-      const text = g.segments.map(s => s.text).join(" ");
-      const div = document.createElement("div");
+      const idx  = Math.min(speakerIndex[g.speaker] || 1, 6);
+      // Use polished segment text if available, otherwise fall back to original
+      const text = g.segments.map(s => polishedSegments[s.id] ?? s.text).join(" ");
+      const div  = document.createElement("div");
       div.className = `speaker-group spk-${idx}`;
       div.innerHTML = `
         <div class="speaker-label">${escHtml(g.speaker)}</div>
