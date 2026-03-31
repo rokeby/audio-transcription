@@ -325,9 +325,16 @@
   });
   fileInput.addEventListener("change", () => { if (fileInput.files.length) showFile(fileInput.files[0]); });
 
+  const CHUNK_SECS    = 10 * 60;  // 10 min per chunk → ~18 MB WAV at 16 kHz mono
+  const CHUNK_RATE    = 16000;    // resample target
+  const DIRECT_LIMIT  = 25 * 1024 * 1024;
+
   function showFile(f) {
     fileChosen.style.display = "block";
-    fileChosen.textContent = `${f.name}  (${(f.size/1024/1024).toFixed(2)} MB)`;
+    const mb = f.size / 1024 / 1024;
+    let note = `${f.name}  (${mb.toFixed(2)} MB)`;
+    if (f.size > DIRECT_LIMIT) note += "  •  Large file — will be split into chunks automatically";
+    fileChosen.textContent = note;
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
@@ -363,7 +370,7 @@
     document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + name));
   }
 
-  // ── Transcribe ─────────────────────────────────────────────────────────────
+  // ── Transcribe (entry point) ───────────────────────────────────────────────
   form.addEventListener("submit", async e => {
     e.preventDefault();
     hideError();
@@ -373,72 +380,200 @@
     if (!apiKey) { showError("Please enter your OpenAI API key."); return; }
     if (!fileInput.files.length) { showError("Please select an audio file."); return; }
 
-    const file = fileInput.files[0];
-    if (file.size > 25 * 1024 * 1024) {
-      showError(`File is ${(file.size/1024/1024).toFixed(1)} MB — OpenAI Whisper's limit is 25 MB.`);
-      return;
-    }
+    const file    = fileInput.files[0];
+    const lang    = document.getElementById("language").value;
+    const prompt  = document.getElementById("prompt").value.trim();
 
     submitBtn.disabled = true;
     progressWrap.style.display = "block";
-    progressBar.style.width = "0%";
-    progressLabel.textContent = "Uploading…";
-
-    // Animate bar while waiting (fetch doesn't expose upload progress)
-    let pct = 0;
-    const iv = setInterval(() => {
-      if (pct < 90) { pct += pct < 60 ? 3 : 0.5; progressBar.style.width = pct + "%"; }
-      if (pct >= 60) progressLabel.textContent = "Transcribing…";
-    }, 300);
+    setProgress(0, "Starting…");
 
     try {
-      const body = new FormData();
-      body.append("file", file);
-      body.append("model", "whisper-1");
-      body.append("response_format", "verbose_json");
-      body.append("timestamp_granularities[]", "segment");
-      const lang = document.getElementById("language").value;
-      const prompt = document.getElementById("prompt").value.trim();
-      if (lang)   body.append("language", lang);
-      if (prompt) body.append("prompt", prompt);
-
-      const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${apiKey}` },
-        body,
-      });
-
-      const data = await res.json();
-      clearInterval(iv);
-      progressBar.style.width = "100%";
-      resetUI();
-
-      if (!res.ok) {
-        showError(data.error?.message || `OpenAI error ${res.status}`);
-        return;
+      let result;
+      if (file.size <= DIRECT_LIMIT) {
+        result = await transcribeDirect(file, apiKey, lang, prompt);
+      } else {
+        result = await transcribeChunked(file, apiKey, lang, prompt);
       }
-
-      // Normalise segments
-      currentSegments = (data.segments || []).map((s, i) => ({
-        id: s.id ?? i,
-        start: s.start,
-        end: s.end,
-        start_fmt: fmtTime(s.start),
-        end_fmt: fmtTime(s.end),
-        text: s.text.trim(),
-      }));
-
-      renderResult(data);
-
-    } catch (err) {
-      clearInterval(iv);
+      setProgress(100, "Done");
       resetUI();
-      showError("Request failed: " + err.message);
+      currentSegments = result.segments;
+      renderResult(result);
+    } catch (err) {
+      resetUI();
+      showError(err.message || "Transcription failed.");
     }
   });
 
+  function setProgress(pct, label) {
+    progressBar.style.width = pct + "%";
+    progressLabel.textContent = label;
+  }
+
+  // ── Direct transcription (file ≤ 25 MB) ───────────────────────────────────
+  async function transcribeDirect(file, apiKey, lang, prompt) {
+    // Fake-animate progress while waiting on fetch (no upload progress API)
+    let pct = 0;
+    const iv = setInterval(() => {
+      if (pct < 90) { pct += pct < 55 ? 3 : 0.4; setProgress(pct, pct < 60 ? "Uploading…" : "Transcribing…"); }
+    }, 300);
+
+    try {
+      const data = await callWhisper(file, apiKey, lang, prompt, file.name);
+      clearInterval(iv);
+      return normaliseResult(data, 0);
+    } finally {
+      clearInterval(iv);
+    }
+  }
+
+  // ── Chunked transcription (file > 25 MB) ──────────────────────────────────
+  async function transcribeChunked(file, apiKey, lang, prompt) {
+    setProgress(2, "Decoding audio…");
+
+    const arrayBuf  = await file.arrayBuffer();
+    // Decode at native rate first, we resample manually
+    const tmpCtx    = new AudioContext();
+    const audioBuf  = await tmpCtx.decodeAudioData(arrayBuf);
+    await tmpCtx.close();
+
+    const duration   = audioBuf.duration;
+    const numChunks  = Math.ceil(duration / CHUNK_SECS);
+
+    const allSegments = [];
+    let   fullText    = "";
+    let   firstLang   = null;
+    let   continuity  = prompt; // seed first chunk with the user prompt
+
+    for (let i = 0; i < numChunks; i++) {
+      const startSec = i * CHUNK_SECS;
+      const endSec   = Math.min((i + 1) * CHUNK_SECS, duration);
+      const baseProgress = 5 + (i / numChunks) * 90;
+      const chunkLabel   = numChunks > 1 ? `Chunk ${i + 1} of ${numChunks}` : "";
+
+      setProgress(baseProgress, `${chunkLabel} — Encoding…`.trim());
+      const wavBlob = extractChunkAsWAV(audioBuf, startSec, endSec, CHUNK_RATE);
+
+      setProgress(baseProgress + (45 / numChunks), `${chunkLabel} — Transcribing…`.trim());
+      const data = await callWhisper(wavBlob, apiKey, lang, continuity, `chunk_${i}.wav`);
+
+      const norm = normaliseResult(data, startSec);
+      allSegments.push(...norm.segments);
+      fullText += (fullText ? " " : "") + norm.text;
+      if (!firstLang && norm.language) firstLang = norm.language;
+
+      // Use the last ~50 words as the prompt for the next chunk for continuity
+      const words = norm.text.trim().split(/\s+/);
+      continuity  = (prompt ? prompt + " " : "") + words.slice(-50).join(" ");
+    }
+
+    return {
+      text:     fullText,
+      language: firstLang,
+      duration,
+      segments: allSegments,
+    };
+  }
+
+  // ── Shared Whisper API call ────────────────────────────────────────────────
+  async function callWhisper(fileOrBlob, apiKey, lang, prompt, filename) {
+    const body = new FormData();
+    body.append("file", fileOrBlob, filename || "audio.wav");
+    body.append("model", "whisper-1");
+    body.append("response_format", "verbose_json");
+    body.append("timestamp_granularities[]", "segment");
+    if (lang)   body.append("language", lang);
+    if (prompt) body.append("prompt", prompt);
+
+    const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${apiKey}` },
+      body,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error?.message || `OpenAI error ${res.status}`);
+    return data;
+  }
+
+  // Normalise a Whisper response into our internal format, offsetting timestamps
+  function normaliseResult(data, offsetSec) {
+    const segments = (data.segments || []).map((s, i) => ({
+      id:        i,
+      start:     (s.start ?? 0) + offsetSec,
+      end:       (s.end   ?? 0) + offsetSec,
+      start_fmt: fmtTime((s.start ?? 0) + offsetSec),
+      end_fmt:   fmtTime((s.end   ?? 0) + offsetSec),
+      text:      (typeof s.text === "string" ? s.text : "").trim(),
+    }));
+    return { text: data.text || "", language: data.language || null, duration: data.duration || 0, segments };
+  }
+
+  // ── Audio chunking helpers ─────────────────────────────────────────────────
+  function extractChunkAsWAV(audioBuf, startSec, endSec, targetRate) {
+    const srcRate    = audioBuf.sampleRate;
+    const srcStart   = Math.floor(startSec * srcRate);
+    const srcLen     = Math.floor((endSec - startSec) * srcRate);
+    const numCh      = audioBuf.numberOfChannels;
+
+    // Mix all channels down to mono
+    const mono = new Float32Array(srcLen);
+    for (let c = 0; c < numCh; c++) {
+      const ch = audioBuf.getChannelData(c);
+      for (let s = 0; s < srcLen; s++) mono[s] += ch[srcStart + s] / numCh;
+    }
+
+    // Resample to targetRate via linear interpolation
+    let samples;
+    if (srcRate === targetRate) {
+      samples = mono;
+    } else {
+      const ratio  = targetRate / srcRate;
+      const dstLen = Math.floor(srcLen * ratio);
+      samples      = new Float32Array(dstLen);
+      for (let i = 0; i < dstLen; i++) {
+        const pos = i / ratio;
+        const lo  = Math.floor(pos);
+        const hi  = Math.min(lo + 1, srcLen - 1);
+        samples[i] = mono[lo] + (mono[hi] - mono[lo]) * (pos - lo);
+      }
+    }
+
+    return encodeWAV(samples, targetRate);
+  }
+
+  function encodeWAV(samples, sampleRate) {
+    const buf  = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buf);
+    const ws   = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+
+    ws(0,  "RIFF");
+    view.setUint32(4,  36 + samples.length * 2, true);
+    ws(8,  "WAVE");
+    ws(12, "fmt ");
+    view.setUint32(16, 16, true);          // PCM chunk size
+    view.setUint16(20, 1,  true);          // PCM format
+    view.setUint16(22, 1,  true);          // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true); // byte rate
+    view.setUint16(32, 2,  true);          // block align
+    view.setUint16(34, 16, true);          // bits per sample
+    ws(36, "data");
+    view.setUint32(40, samples.length * 2, true);
+
+    let off = 44;
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      off += 2;
+    }
+    return new Blob([buf], { type: "audio/wav" });
+  }
+
   // ── Render result ──────────────────────────────────────────────────────────
   function renderResult(data) {
+    // Re-number IDs globally (chunks reset to 0)
+    currentSegments.forEach((s, i) => s.id = i);
+
     const parts = [];
     if (data.language) parts.push(data.language.toUpperCase());
     if (data.duration)  parts.push(fmtDur(data.duration));

@@ -365,28 +365,38 @@
   });
   fileInput.addEventListener("change", () => { if (fileInput.files.length) showFile(fileInput.files[0]); });
 
+  const CHUNK_SECS   = 10 * 60;
+  const CHUNK_RATE   = 16000;
+  const DIRECT_LIMIT = 25 * 1024 * 1024;
+
   function showFile(file) {
     fileChosen.style.display = "block";
-    fileChosen.textContent = `${file.name}  (${(file.size / 1024 / 1024).toFixed(2)} MB)`;
+    const mb = file.size / 1024 / 1024;
+    let note = `${file.name}  (${mb.toFixed(2)} MB)`;
+    if (file.size > DIRECT_LIMIT) note += "  •  Large file — will be split into chunks automatically";
+    fileChosen.textContent = note;
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
   function showError(msg) { errorMsg.textContent = msg; errorMsg.style.display = "block"; }
   function hideError()    { errorMsg.style.display = "none"; }
   function resetUI()      { submitBtn.disabled = false; progressWrap.style.display = "none"; }
+  function setProgress(pct, label) { progressBar.style.width = pct + "%"; progressLabel.textContent = label; }
 
   // ── Tabs ───────────────────────────────────────────────────────────────────
   document.getElementById("tabs").addEventListener("click", e => {
     const tab = e.target.closest(".tab");
     if (!tab) return;
-    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
-    document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
-    tab.classList.add("active");
-    document.getElementById("panel-" + tab.dataset.tab).classList.add("active");
+    switchTab(tab.dataset.tab);
   });
 
+  function switchTab(name) {
+    document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
+    document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + name));
+  }
+
   // ── Transcribe ─────────────────────────────────────────────────────────────
-  form.addEventListener("submit", e => {
+  form.addEventListener("submit", async e => {
     e.preventDefault();
     hideError();
     resultCard.style.display = "none";
@@ -395,78 +405,173 @@
     if (!currentApiKey) { showError("Please enter your OpenAI API key."); return; }
     if (!fileInput.files.length) { showError("Please select an audio file."); return; }
 
-    const fileMB = fileInput.files[0].size / 1024 / 1024;
-    if (fileMB > 25) {
-      showError(`File is ${fileMB.toFixed(1)} MB — OpenAI Whisper's limit is 25 MB. Please trim or compress it first.`);
-      return;
-    }
+    const file   = fileInput.files[0];
+    const lang   = document.getElementById("language").value;
+    const prompt = document.getElementById("prompt").value.trim();
 
-    const formData = new FormData(form);
     submitBtn.disabled = true;
     progressWrap.style.display = "block";
-    progressBar.style.width = "0%";
-    progressLabel.textContent = "Buffering file…";
+    setProgress(0, "Starting…");
 
-    const xhr = new XMLHttpRequest();
-    xhr.timeout = 5 * 60 * 1000;
-
-    xhr.upload.addEventListener("progress", evt => {
-      if (evt.lengthComputable) {
-        const pct = Math.round((evt.loaded / evt.total) * 60);
-        progressBar.style.width = pct + "%";
-        progressLabel.textContent = `Uploading… ${Math.round((evt.loaded / evt.total) * 100)}%`;
+    try {
+      let result;
+      if (file.size <= DIRECT_LIMIT) {
+        result = await transcribeDirect(file, lang, prompt);
+      } else {
+        result = await transcribeChunked(file, lang, prompt);
       }
-    });
-
-    xhr.upload.addEventListener("load", () => {
-      progressBar.style.width = "65%";
-      progressLabel.textContent = "Sending to OpenAI…";
-      let pct = 65;
-      const iv = setInterval(() => {
-        if (pct < 95) { pct += 0.4; progressBar.style.width = pct + "%"; }
-        else clearInterval(iv);
-      }, 500);
-      xhr._iv = iv;
-    });
-
-    xhr.addEventListener("load", () => {
-      clearInterval(xhr._iv);
-      progressBar.style.width = "100%";
+      setProgress(100, "Done");
       resetUI();
-
-      if (xhr.status === 413) { showError("File too large — the server rejected it."); return; }
-
-      let data;
-      try { data = JSON.parse(xhr.responseText); }
-      catch { showError("Unexpected server response. Check the terminal for errors."); return; }
-
-      if (xhr.status !== 200) { showError(data.error || "Transcription failed."); return; }
-
-      renderResult(data);
-    });
-
-    xhr.addEventListener("error",   () => { clearInterval(xhr._iv); resetUI(); showError("Network error — is the Flask server running?"); });
-    xhr.addEventListener("timeout", () => { clearInterval(xhr._iv); resetUI(); showError("Request timed out after 5 minutes."); });
-
-    xhr.open("POST", "/transcribe");
-    xhr.send(formData);
+      currentSegments = result.segments;
+      currentSegments.forEach((s, i) => s.id = i);
+      renderResult(result);
+    } catch (err) {
+      resetUI();
+      showError(err.message || "Transcription failed.");
+    }
   });
+
+  // ── Direct transcription (file ≤ 25 MB) via Flask ─────────────────────────
+  async function transcribeDirect(file, lang, prompt) {
+    let pct = 0;
+    const iv = setInterval(() => {
+      if (pct < 90) { pct += pct < 55 ? 3 : 0.4; setProgress(pct, pct < 60 ? "Uploading…" : "Transcribing…"); }
+    }, 300);
+    try {
+      const data = await callFlask(file, file.name, lang, prompt);
+      clearInterval(iv);
+      return normaliseResult(data, 0);
+    } finally { clearInterval(iv); }
+  }
+
+  // ── Chunked transcription (file > 25 MB) client-side ──────────────────────
+  async function transcribeChunked(file, lang, prompt) {
+    setProgress(2, "Decoding audio…");
+
+    const arrayBuf = await file.arrayBuffer();
+    const tmpCtx   = new AudioContext();
+    const audioBuf = await tmpCtx.decodeAudioData(arrayBuf);
+    await tmpCtx.close();
+
+    const duration  = audioBuf.duration;
+    const numChunks = Math.ceil(duration / CHUNK_SECS);
+
+    const allSegments = [];
+    let fullText  = "";
+    let firstLang = null;
+    let continuity = prompt;
+
+    for (let i = 0; i < numChunks; i++) {
+      const startSec     = i * CHUNK_SECS;
+      const endSec       = Math.min((i + 1) * CHUNK_SECS, duration);
+      const baseProgress = 5 + (i / numChunks) * 90;
+      const chunkLabel   = numChunks > 1 ? `Chunk ${i + 1} of ${numChunks}` : "";
+
+      setProgress(baseProgress, `${chunkLabel} — Encoding…`.trim());
+      const wavBlob = extractChunkAsWAV(audioBuf, startSec, endSec, CHUNK_RATE);
+
+      setProgress(baseProgress + (45 / numChunks), `${chunkLabel} — Transcribing…`.trim());
+      const data = await callFlask(wavBlob, `chunk_${i}.wav`, lang, continuity);
+
+      const norm = normaliseResult(data, startSec);
+      allSegments.push(...norm.segments);
+      fullText += (fullText ? " " : "") + norm.text;
+      if (!firstLang && norm.language) firstLang = norm.language;
+
+      const words = norm.text.trim().split(/\s+/);
+      continuity  = (prompt ? prompt + " " : "") + words.slice(-50).join(" ");
+    }
+
+    return { text: fullText, language: firstLang, duration, segments: allSegments };
+  }
+
+  // ── Send chunk/file to Flask /transcribe ───────────────────────────────────
+  async function callFlask(fileOrBlob, filename, lang, prompt) {
+    const body = new FormData();
+    body.append("file", fileOrBlob, filename);
+    body.append("api_key", currentApiKey);
+    if (lang)   body.append("language", lang);
+    if (prompt) body.append("prompt", prompt);
+
+    const res  = await fetch("/transcribe", { method: "POST", body });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `Server error ${res.status}`);
+    return data;
+  }
+
+  function normaliseResult(data, offsetSec) {
+    const segments = (data.segments || []).map((s, i) => ({
+      id:        i,
+      start:     (s.start ?? 0) + offsetSec,
+      end:       (s.end   ?? 0) + offsetSec,
+      start_fmt: fmtTime((s.start ?? 0) + offsetSec),
+      end_fmt:   fmtTime((s.end   ?? 0) + offsetSec),
+      text:      (s.text || "").trim(),
+    }));
+    return { text: data.text || "", language: data.language || null, duration: data.duration || 0, segments };
+  }
+
+  // ── Audio chunking helpers ─────────────────────────────────────────────────
+  function extractChunkAsWAV(audioBuf, startSec, endSec, targetRate) {
+    const srcRate  = audioBuf.sampleRate;
+    const srcStart = Math.floor(startSec * srcRate);
+    const srcLen   = Math.floor((endSec - startSec) * srcRate);
+    const numCh    = audioBuf.numberOfChannels;
+
+    const mono = new Float32Array(srcLen);
+    for (let c = 0; c < numCh; c++) {
+      const ch = audioBuf.getChannelData(c);
+      for (let s = 0; s < srcLen; s++) mono[s] += ch[srcStart + s] / numCh;
+    }
+
+    let samples;
+    if (srcRate === targetRate) {
+      samples = mono;
+    } else {
+      const ratio  = targetRate / srcRate;
+      const dstLen = Math.floor(srcLen * ratio);
+      samples      = new Float32Array(dstLen);
+      for (let i = 0; i < dstLen; i++) {
+        const pos = i / ratio;
+        const lo  = Math.floor(pos);
+        const hi  = Math.min(lo + 1, srcLen - 1);
+        samples[i] = mono[lo] + (mono[hi] - mono[lo]) * (pos - lo);
+      }
+    }
+    return encodeWAV(samples, targetRate);
+  }
+
+  function encodeWAV(samples, sampleRate) {
+    const buf  = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buf);
+    const ws   = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+
+    ws(0, "RIFF"); view.setUint32(4, 36 + samples.length * 2, true);
+    ws(8, "WAVE"); ws(12, "fmt ");
+    view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    ws(36, "data"); view.setUint32(40, samples.length * 2, true);
+
+    let off = 44;
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      off += 2;
+    }
+    return new Blob([buf], { type: "audio/wav" });
+  }
 
   // ── Render result ──────────────────────────────────────────────────────────
   function renderResult(data) {
-    currentSegments = data.segments || [];
-
-    // Meta
     const parts = [];
     if (data.language) parts.push(data.language.toUpperCase());
     if (data.duration)  parts.push(fmtDur(data.duration));
     if (currentSegments.length) parts.push(`${currentSegments.length} segments`);
     resultMeta.textContent = parts.join(" · ");
 
-    // Plain text — paragraph-break on longer pauses
     plainText.textContent = formatPlainText(data.text, currentSegments);
 
-    // Segments tab
     segmentsView.innerHTML = "";
     if (currentSegments.length) {
       currentSegments.forEach(s => {
@@ -480,29 +585,22 @@
       segmentsView.innerHTML = `<div style="color:#6e6e73;font-size:14px">No segment data returned.</div>`;
     }
 
-    // Reset speakers tab
     speakersTab.style.display = "none";
     speakerView.innerHTML = "";
-    // Make sure we're on the plain tab
     switchTab("plain");
 
     resultCard.style.display = "block";
     resultCard.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  // Insert a blank line between segments where the pause > 1.5 s
   function formatPlainText(fullText, segments) {
     if (!segments || segments.length < 2) return fullText.trim();
     const lines = [];
     let buf = segments[0].text;
     for (let i = 1; i < segments.length; i++) {
       const gap = segments[i].start - segments[i - 1].end;
-      if (gap > 1.5) {
-        lines.push(buf.trim());
-        buf = segments[i].text;
-      } else {
-        buf += " " + segments[i].text;
-      }
+      if (gap > 1.5) { lines.push(buf.trim()); buf = segments[i].text; }
+      else buf += " " + segments[i].text;
     }
     lines.push(buf.trim());
     return lines.join("\n\n");
@@ -522,7 +620,6 @@
       });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || "Diarization failed");
-
       renderSpeakers(data.speakers);
     } catch (err) {
       showError("Speaker detection failed: " + err.message);
@@ -534,45 +631,35 @@
 
   // ── Render speakers ────────────────────────────────────────────────────────
   function renderSpeakers(speakerMap) {
-    // speakerMap: [{id, speaker}, ...]
     const byId = {};
     speakerMap.forEach(s => byId[s.id] = s.speaker);
 
-    // Assign stable colour indices
-    const speakerOrder = [];
     const speakerIndex = {};
+    let nextIdx = 1;
     currentSegments.forEach(s => {
       const spk = byId[s.id] || "Unknown";
-      if (!(spk in speakerIndex)) {
-        speakerIndex[spk] = speakerOrder.length + 1;
-        speakerOrder.push(spk);
-      }
+      if (!(spk in speakerIndex)) speakerIndex[spk] = nextIdx++;
     });
 
-    // Group consecutive same-speaker segments
     const groups = [];
     currentSegments.forEach(s => {
       const spk = byId[s.id] || "Unknown";
-      if (groups.length && groups[groups.length - 1].speaker === spk) {
+      if (groups.length && groups[groups.length - 1].speaker === spk)
         groups[groups.length - 1].segments.push(s);
-      } else {
+      else
         groups.push({ speaker: spk, segments: [s] });
-      }
     });
 
     speakerView.innerHTML = "";
     groups.forEach(g => {
-      const idx = speakerIndex[g.speaker] || 1;
-      const text = g.segments.map(s => s.text.trim()).join(" ");
-      const startTime = g.segments[0].start_fmt;
-      const endTime   = g.segments[g.segments.length - 1].end_fmt;
-
-      const div = document.createElement("div");
+      const idx  = Math.min(speakerIndex[g.speaker] || 1, 6);
+      const text = g.segments.map(s => s.text).join(" ");
+      const div  = document.createElement("div");
       div.className = `speaker-group spk-${idx}`;
       div.innerHTML = `
         <div class="speaker-label">${escHtml(g.speaker)}</div>
         <div class="speaker-bubble">${escHtml(text)}</div>
-        <div class="speaker-bubble-time">${startTime} – ${endTime}</div>
+        <div class="speaker-bubble-time">${g.segments[0].start_fmt} – ${g.segments[g.segments.length-1].end_fmt}</div>
       `;
       speakerView.appendChild(div);
     });
@@ -589,13 +676,10 @@
       text = plainText.textContent;
     } else if (activeTab === "segments") {
       text = currentSegments.map(s => `[${s.start_fmt}] ${s.text}`).join("\n");
-    } else if (activeTab === "speakers") {
-      const groups = speakerView.querySelectorAll(".speaker-group");
-      text = Array.from(groups).map(g => {
-        const spk = g.querySelector(".speaker-label").textContent;
-        const bubble = g.querySelector(".speaker-bubble").textContent;
-        return `${spk}\n${bubble}`;
-      }).join("\n\n");
+    } else {
+      text = Array.from(speakerView.querySelectorAll(".speaker-group")).map(g =>
+        `${g.querySelector(".speaker-label").textContent}\n${g.querySelector(".speaker-bubble").textContent}`
+      ).join("\n\n");
     }
     navigator.clipboard.writeText(text).then(() => {
       copyBtn.textContent = "Copied!";
@@ -604,9 +688,9 @@
   });
 
   // ── Utils ──────────────────────────────────────────────────────────────────
-  function switchTab(name) {
-    document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
-    document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + name));
+  function fmtTime(secs) {
+    const m = Math.floor(secs / 60), s = Math.floor(secs % 60), h = Math.floor(m / 60);
+    return h ? `${h}:${String(m%60).padStart(2,"0")}:${String(s).padStart(2,"0")}` : `${m}:${String(s).padStart(2,"0")}`;
   }
 
   function fmtDur(secs) {
