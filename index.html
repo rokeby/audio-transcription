@@ -108,6 +108,15 @@
     .btn-speaker:hover { background: #333; }
     .btn-speaker:disabled { background: #999; cursor: not-allowed; }
 
+    .btn-polish {
+      padding: 9px 18px; background: #6e3de8; color: #fff;
+      border: none; border-radius: 8px; font-size: 13px; font-weight: 600;
+      cursor: pointer; transition: background 0.15s; font-family: inherit;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .btn-polish:hover { background: #7c4ef0; }
+    .btn-polish:disabled { background: #b8a0e8; cursor: not-allowed; }
+
     .progress-wrap { display: none; margin-top: 16px; }
     .progress-bar-bg { background: #e5e5ea; border-radius: 100px; height: 6px; overflow: hidden; }
     .progress-bar { height: 100%; width: 0%; background: #0071e3; border-radius: 100px; transition: width 0.4s ease; }
@@ -262,6 +271,9 @@
         <div class="result-meta" id="resultMeta"></div>
       </div>
       <div class="result-actions">
+        <button class="btn-polish" id="polishBtn" style="display:none">
+          <span>Polish transcript</span>
+        </button>
         <button class="btn-speaker" id="diarizeBtn" style="display:none">
           <span>Identify Speakers</span>
         </button>
@@ -270,13 +282,17 @@
     </div>
 
     <div class="tabs" id="tabs">
-      <div class="tab active" data-tab="plain">Plain Text</div>
+      <div class="tab active" data-tab="plain">Original</div>
+      <div class="tab" data-tab="polished" id="polishedTab" style="display:none">Polished</div>
       <div class="tab" data-tab="segments">Segments</div>
       <div class="tab" data-tab="speakers" id="speakersTab" style="display:none">Speakers</div>
     </div>
 
     <div class="tab-panel active" id="panel-plain">
       <div class="plain-text" id="plainText"></div>
+    </div>
+    <div class="tab-panel" id="panel-polished">
+      <div class="plain-text" id="polishedText"></div>
     </div>
     <div class="tab-panel" id="panel-segments">
       <div class="segments-view" id="segmentsView"></div>
@@ -307,6 +323,9 @@
   const segmentsView  = document.getElementById("segmentsView");
   const speakerView   = document.getElementById("speakerView");
   const diarizeBtn    = document.getElementById("diarizeBtn");
+  const polishBtn     = document.getElementById("polishBtn");
+  const polishedText  = document.getElementById("polishedText");
+  const polishedTab   = document.getElementById("polishedTab");
   const copyBtn       = document.getElementById("copyBtn");
   const speakersTab   = document.getElementById("speakersTab");
   const apiKeyInput   = document.getElementById("apiKey");
@@ -591,11 +610,14 @@
         segmentsView.appendChild(row);
       });
       diarizeBtn.style.display = "inline-flex";
+      polishBtn.style.display  = "inline-flex";
     } else {
       segmentsView.innerHTML = `<div style="color:#6e6e73;font-size:14px">No segment data returned.</div>`;
     }
 
-    speakersTab.style.display = "none";
+    speakersTab.style.display  = "none";
+    polishedTab.style.display  = "none";
+    polishedText.textContent   = "";
     speakerView.innerHTML = "";
     switchTab("plain");
 
@@ -615,6 +637,52 @@
     lines.push(buf.trim());
     return lines.join("\n\n");
   }
+
+  // ── Polish ─────────────────────────────────────────────────────────────────
+  polishBtn.addEventListener("click", async () => {
+    const apiKey = apiKeyInput.value.trim();
+    if (!apiKey) { showError("API key required for polishing."); return; }
+
+    polishBtn.disabled = true;
+    polishBtn.innerHTML = `<span class="spinner"></span> Polishing…`;
+
+    const raw = plainText.textContent.trim();
+    const systemPrompt =
+      "You are a professional transcript editor. " +
+      "Your job is to clean up a speech transcript — fix punctuation, capitalisation, and sentence boundaries, " +
+      "and silently remove filler words and sounds (um, uh, er, ah, hmm, like [as filler], you know [as filler], " +
+      "right [as filler], so [sentence-starting filler], false starts, repetitions). " +
+      "Preserve every meaningful word and the speaker's vocabulary exactly. " +
+      "Preserve paragraph breaks. " +
+      "Return only the cleaned transcript — no commentary, no headings, no markdown.";
+
+    try {
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          temperature: 0.2,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user",   content: raw },
+          ],
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || `OpenAI error ${res.status}`);
+
+      polishedText.textContent = data.choices[0].message.content.trim();
+      polishedTab.style.display = "";
+      switchTab("polished");
+    } catch (err) {
+      showError("Polishing failed: " + err.message);
+    } finally {
+      polishBtn.disabled = false;
+      polishBtn.innerHTML = `<span>Re-polish</span>`;
+    }
+  });
 
   // ── Diarize ────────────────────────────────────────────────────────────────
   diarizeBtn.addEventListener("click", async () => {
@@ -702,6 +770,8 @@
     let text = "";
     if (activeTab === "plain") {
       text = plainText.textContent;
+    } else if (activeTab === "polished") {
+      text = polishedText.textContent;
     } else if (activeTab === "segments") {
       text = currentSegments.map(s => `[${s.start_fmt}] ${s.text}`).join("\n");
     } else {
